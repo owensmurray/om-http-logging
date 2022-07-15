@@ -1,26 +1,30 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE TemplateHaskell #-}
 
 {- | Description: Logging utilities for WAI http servers. -}
 module OM.HTTP.Logging (
   logExceptionsAndContinue,
+  requestLogging,
 ) where
 
 
 import Control.Concurrent (threadDelay)
-import Control.Exception.Safe (SomeException, throwM,
-  tryAny)
+import Control.Exception.Safe (SomeException, throwM, tryAny)
 import Control.Monad (void)
 import Control.Monad.IO.Class (MonadIO, liftIO)
-import Control.Monad.Logger (Loc, LogLevel, LogSource, LogStr,
-  MonadLoggerIO, logError, runLoggingT)
-import Data.String (fromString, IsString)
+import Control.Monad.Logger.CallStack (Loc, LogLevel, LogSource, LogStr,
+  MonadLoggerIO, logError, logInfo, runLoggingT)
+import Data.String (IsString, fromString)
+import Data.Text (Text)
+import Data.Text.Encoding (decodeUtf8)
+import Data.Time (UTCTime, diffUTCTime, getCurrentTime)
 import Data.UUID (UUID)
 import Data.UUID.V1 (nextUUID)
-import Network.HTTP.Types (internalServerError500)
-import Network.Wai (Middleware, Response, ResponseReceived,
-  responseLBS)
+import Network.HTTP.Types (Status(statusCode, statusMessage),
+  internalServerError500)
+import Network.Wai (Request(rawPathInfo, rawQueryString, requestMethod),
+  Middleware, Response, ResponseReceived, responseLBS, responseStatus)
+
 
 {- |
   Logs all exceptions, and returns a 500 Internal Server error. 
@@ -70,7 +74,7 @@ logExceptionsAndContinue logging app req respond = (`runLoggingT` logging) $
     logProblem :: (MonadLoggerIO m) => SomeException -> m UUID
     logProblem err = do
       uuid <- getUUID
-      $(logError)
+      logError
         $ "Internal Server Error [" <> showt uuid <> "]: "
         <> showt err
       return uuid
@@ -79,5 +83,51 @@ logExceptionsAndContinue logging app req respond = (`runLoggingT` logging) $
 {- | Like 'show', but for any string-like thing. -}
 showt :: (Show a, IsString b) => a -> b
 showt = fromString . show
+
+
+{- |
+  Logs an HTTP request by emitting two log messages. The first messages
+  logs that the request has begun. The second messages logs the status
+  result and timing of the request once it is finished.
+
+  > Starting request: GET /foo
+  > GET /foo --> 200 Ok (0.001s)
+
+  This can help debugging requests that hang or crash for whatever reason.
+-}
+requestLogging
+  :: (Loc -> LogSource -> LogLevel -> LogStr -> IO ())
+  -> Middleware
+requestLogging logging app req respond =
+    (`runLoggingT` logging) $ do
+      logInfo $ "Starting request: " <> reqStr
+      liftIO . app req . loggingRespond =<< liftIO getCurrentTime
+  where
+    {- | Delegate to the underlying responder, and do some logging. -}
+    loggingRespond :: UTCTime -> Response -> IO ResponseReceived
+    loggingRespond start response = (`runLoggingT` logging) $ do
+      {-
+        Execute the underlying responder first so we get an accurate
+        measurement of the request duration.
+      -}
+      ack <- liftIO $ respond response
+      now <- liftIO getCurrentTime
+      logInfo
+        $ reqStr <> " --> " <> showStatus (responseStatus response)
+        <> " (" <> showt (diffUTCTime now start) <> ")"
+      return ack
+
+    {- | A Text representation of the request, suitable for logging. -}
+    reqStr :: Text
+    reqStr = decodeUtf8
+      $ requestMethod req <> " " <> rawPathInfo req <> rawQueryString req
+
+    {- |
+      @instance Show Status@ shows the Haskell structure, which is
+      not suitable for logging.
+    -}
+    showStatus :: Status -> Text
+    showStatus stat =
+      (showt . statusCode) stat <> " " <> (decodeUtf8 . statusMessage) stat
 
 
